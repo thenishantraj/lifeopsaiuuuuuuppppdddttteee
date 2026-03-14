@@ -35,7 +35,8 @@ class LifeOpsDatabase:
             notifications_email INTEGER DEFAULT 1,
             notifications_push INTEGER DEFAULT 1,
             notifications_weekly INTEGER DEFAULT 1,
-            font_size TEXT DEFAULT 'Medium'
+            font_size TEXT DEFAULT 'Medium',
+            is_verified INTEGER DEFAULT 0
         )""")
 
         c.execute("""
@@ -146,8 +147,78 @@ class LifeOpsDatabase:
         conn.commit()
         conn.close()
 
+    def _run_migrations(self, conn):
+        """Add new columns to existing databases without breaking them."""
+        existing = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if 'is_verified' not in existing:
+            conn.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 0")
+            conn.commit()
+
     def _hash_password(self, password: str) -> str:
         return hashlib.sha256(password.encode()).hexdigest()
+
+    def email_exists(self, email: str) -> bool:
+        """Check if an email is already registered (verified or not)."""
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT id FROM users WHERE email=?",
+            (email.lower().strip(),)
+        ).fetchone()
+        conn.close()
+        return row is not None
+
+    def create_user_unverified(self, email: str, password: str, name: str) -> bool:
+        """
+        Insert a user record with is_verified=0.
+        Called during signup BEFORE OTP is confirmed.
+        If the email already exists as unverified, overwrites it (allows resend).
+        """
+        try:
+            conn = get_conn()
+            user_id = str(uuid.uuid4())
+            now = datetime.now().isoformat()
+            email_clean = email.lower().strip()
+            conn.execute(
+                """INSERT INTO users (id, email, password_hash, name, joined_at, is_verified)
+                   VALUES (?, ?, ?, ?, ?, 0)
+                   ON CONFLICT(email) DO UPDATE SET
+                       password_hash=excluded.password_hash,
+                       name=excluded.name,
+                       is_verified=0""",
+                (user_id, email_clean, self._hash_password(password), name, now)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    def verify_user_email(self, email: str) -> bool:
+        """Set is_verified=1 for the given email. Called after OTP matches."""
+        try:
+            conn = get_conn()
+            conn.execute(
+                "UPDATE users SET is_verified=1 WHERE email=?",
+                (email.lower().strip(),)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    def delete_unverified_user(self, email: str) -> None:
+        """Remove an unverified user record (e.g. if they cancel signup)."""
+        try:
+            conn = get_conn()
+            conn.execute(
+                "DELETE FROM users WHERE email=? AND is_verified=0",
+                (email.lower().strip(),)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     def create_user(self, email: str, password: str, name: str) -> bool:
         try:
@@ -163,18 +234,28 @@ class LifeOpsDatabase:
         except sqlite3.IntegrityError:
             return False
 
-    def authenticate_user(self, email: str, password: str) -> Optional[Dict]:
+    def authenticate_user(self, email: str, password: str):
+        """
+        Returns:
+            dict  -> credentials valid and account is verified
+            "unverified" -> credentials valid but email not yet verified
+            None  -> invalid credentials
+        """
         conn = get_conn()
         row = conn.execute(
             "SELECT * FROM users WHERE email=? AND password_hash=?",
             (email.lower().strip(), self._hash_password(password))
         ).fetchone()
         if row:
-            conn.execute("UPDATE users SET last_login=? WHERE id=?", (datetime.now().isoformat(), row["id"]))
+            user = dict(row)
+            if not user.get('is_verified', 0):
+                conn.close()
+                return "unverified"
+            conn.execute("UPDATE users SET last_login=? WHERE id=?",
+                         (datetime.now().isoformat(), user["id"]))
             conn.commit()
-            result = dict(row)
             conn.close()
-            return result
+            return user
         conn.close()
         return None
 
