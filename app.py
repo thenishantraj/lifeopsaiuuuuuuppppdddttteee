@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from database import LifeOpsDatabase
 from crew_setup import LifeOpsCrew
+from utils import send_otp_email, generate_otp
 
 os.environ["OPENAI_API_KEY"] = "not-required"
 os.environ["OPENAI_API_BASE"] = ""
@@ -380,7 +381,14 @@ def init_state():
         'pomodoro_active': False, 'pomodoro_time': 25 * 60,
         'pomodoro_work': True, 'pomodoro_subject': '',
         'break_time': 5 * 60,
-        'todo_items': [], 'medicines': [], 'bills': [], 'notes': []
+        'todo_items': [], 'medicines': [], 'bills': [], 'notes': [],
+        'otp_pending': False,
+        'otp_code': '',
+        'otp_email': '',
+        'otp_name': '',
+        'otp_pass': '',
+        'otp_ts': None,
+        'otp_attempts': 0
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -452,6 +460,150 @@ def render_topnav():
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+
+def _render_signup_form():
+    """Step 1 of 2: collect registration details and send OTP."""
+    from datetime import datetime as _dt
+    with st.form("signup_form", clear_on_submit=False):
+        s_name  = st.text_input("Full name",         placeholder="Alex Kumar",         key="sf_name")
+        s_email = st.text_input("Email address",     placeholder="you@example.com",    key="sf_email")
+        s_pass  = st.text_input("Password",          type="password",
+                                placeholder="Min 6 characters",                        key="sf_pass")
+        s_pass2 = st.text_input("Confirm password",  type="password",
+                                placeholder="Repeat password",                         key="sf_pass2")
+        st.markdown("<br>", unsafe_allow_html=True)
+        submitted = st.form_submit_button(
+            "Send Verification Code →", type="primary", use_container_width=True
+        )
+
+    if submitted:
+        if not all([s_name, s_email, s_pass, s_pass2]):
+            st.error("Please fill in all fields.")
+            return
+        if len(s_pass) < 6:
+            st.error("Password must be at least 6 characters.")
+            return
+        if s_pass != s_pass2:
+            st.error("Passwords do not match.")
+            return
+
+        # Check if email already belongs to a verified account
+        if db.email_exists(s_email):
+            existing = db.authenticate_user(s_email, s_pass)
+            if existing == "unverified":
+                pass  # allow resend for unverified registrations
+            elif existing is not None:
+                st.error("This email is already registered. Please sign in.")
+                return
+            # If existing is None but email_exists: different password, already taken
+            elif existing is None:
+                st.error("This email is already registered. Please sign in.")
+                return
+
+        with st.spinner("Sending verification code to your email…"):
+            success, otp_code, msg = send_otp_email(s_email)
+
+        if not success:
+            st.error(f"Could not send OTP: {msg}")
+            st.info("Tip: Check SENDER_EMAIL and APP_PASSWORD in your secrets or .env file.")
+            return
+
+        # Save pending signup data to session_state
+        st.session_state.otp_pending   = True
+        st.session_state.otp_code      = otp_code
+        st.session_state.otp_email     = s_email.lower().strip()
+        st.session_state.otp_name      = s_name.strip()
+        st.session_state.otp_pass      = s_pass
+        st.session_state.otp_ts        = _dt.now()
+        st.session_state.otp_attempts  = 0
+
+        # Stage unverified record so verify_user_email can update it
+        db.create_user_unverified(s_email, s_pass, s_name)
+        st.rerun()
+
+
+def _render_otp_verify_ui():
+    """Step 2 of 2: verify the OTP and complete registration."""
+    from datetime import datetime as _dt
+
+    email = st.session_state.otp_email
+
+    st.markdown(f"""
+    <div style="background:#EEF2FF;border:1px solid #C7D2FE;border-radius:12px;
+                padding:18px 20px;margin-bottom:20px;">
+        <div style="font-size:15px;font-weight:700;color:#4338CA;margin-bottom:4px;">
+            ✉️ Verification Code Sent
+        </div>
+        <div style="font-size:13px;color:#64748B;">
+            A 6-digit code was sent to <strong>{email}</strong>.<br/>
+            Enter it below within <strong>10 minutes</strong>.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # OTP expiry check (10 minutes)
+    otp_ts = st.session_state.get('otp_ts')
+    if otp_ts and (_dt.now() - otp_ts).total_seconds() > 600:
+        st.warning("⏱️ OTP expired. Please register again.")
+        db.delete_unverified_user(email)
+        for k in ['otp_pending','otp_code','otp_email','otp_name','otp_pass','otp_ts','otp_attempts']:
+            st.session_state[k] = '' if k not in ('otp_pending',) else False
+        st.session_state.otp_attempts = 0
+        st.rerun()
+        return
+
+    otp_input = st.text_input(
+        "Enter 6-digit code", placeholder="_ _ _ _ _ _",
+        max_chars=6, key="otp_input_field"
+    )
+
+    col_verify, col_resend, col_back = st.columns([2, 1, 1])
+
+    with col_verify:
+        if st.button("✅ Verify & Create Account", type="primary", use_container_width=True, key="btn_verify_otp"):
+            if not otp_input.strip():
+                st.error("Please enter the OTP.")
+            elif st.session_state.otp_attempts >= 5:
+                st.error("Too many incorrect attempts. Please register again.")
+                db.delete_unverified_user(email)
+                st.session_state.otp_pending = False
+                st.rerun()
+            elif otp_input.strip() == st.session_state.otp_code:
+                # OTP correct — verify the user
+                if db.verify_user_email(email):
+                    st.success("🎉 Email verified! Your account is ready. Please sign in.")
+                    # Clear all OTP state
+                    for k in ['otp_pending','otp_code','otp_email','otp_name',
+                               'otp_pass','otp_ts','otp_attempts']:
+                        st.session_state[k] = '' if k not in ('otp_pending',) else False
+                    st.session_state.otp_attempts = 0
+                    st.rerun()
+                else:
+                    st.error("Account activation failed. Please try registering again.")
+            else:
+                st.session_state.otp_attempts += 1
+                remaining = 5 - st.session_state.otp_attempts
+                st.error(f"Incorrect OTP. {remaining} attempt(s) remaining.")
+
+    with col_resend:
+        if st.button("🔄 Resend", use_container_width=True, key="btn_resend_otp"):
+            with st.spinner("Resending…"):
+                success, new_otp, msg = send_otp_email(email)
+            if success:
+                st.session_state.otp_code     = new_otp
+                st.session_state.otp_ts       = _dt.now()
+                st.session_state.otp_attempts = 0
+                st.success("New code sent!")
+            else:
+                st.error(f"Resend failed: {msg}")
+
+    with col_back:
+        if st.button("← Back", use_container_width=True, key="btn_back_signup"):
+            db.delete_unverified_user(email)
+            st.session_state.otp_pending = False
+            st.rerun()
+
+
 def login_page():
     st.markdown("""
 <style>
@@ -495,23 +647,11 @@ def login_page():
                             st.error("Invalid credentials. Please try again.")
 
         with tab2:
-            with st.form("signup_form", clear_on_submit=True):
-                s_name = st.text_input("Full name", placeholder="Alex Kumar")
-                s_email = st.text_input("Email address", placeholder="you@example.com")
-                s_pass = st.text_input("Password", type="password", placeholder="Min 6 characters")
-                s_pass2 = st.text_input("Confirm password", type="password", placeholder="Repeat password")
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.form_submit_button("Create free account →", type="primary", use_container_width=True):
-                    if not all([s_name, s_email, s_pass, s_pass2]):
-                        st.error("Please fill in all fields")
-                    elif len(s_pass) < 6:
-                        st.error("Password must be at least 6 characters")
-                    elif s_pass != s_pass2:
-                        st.error("Passwords do not match")
-                    elif db.create_user(s_email, s_pass, s_name):
-                        st.success("✅ Account created! Please sign in.")
-                    else:
-                        st.error("Email already registered. Please sign in.")
+            # ── OTP VERIFICATION FLOW ──────────────────────────────
+            if st.session_state.otp_pending:
+                _render_otp_verify_ui()
+            else:
+                _render_signup_form()
 
         st.markdown("""
         <div style="text-align:center; margin-top:32px; padding: 16px; background:#F7F8FC; border-radius:12px;">
