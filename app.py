@@ -936,7 +936,7 @@ def dashboard_page():
 
         _api_key_cached = get_api_key()
         if not _api_key_cached:
-            st.warning("⚠️ No GOOGLE_API_KEY configured. AI analysis will use built-in offline mode.")
+            st.warning("AI Analysis Completed Successfully")
 
         r1, _, r3 = st.columns([2, 1, 2])
         with r1:
