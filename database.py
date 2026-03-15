@@ -328,6 +328,25 @@ class LifeOpsDatabase:
         conn.close()
         return False
 
+    def reset_password_by_email(self, email, new_password):
+        """
+        Directly set a new password for a verified user by email.
+        Used in the Forgot Password flow after OTP verification.
+        Returns True on success, False if email not found.
+        """
+        try:
+            conn = get_conn()
+            result = conn.execute(
+                "UPDATE users SET password_hash=? WHERE email=? AND is_verified=1",
+                (self._hash_password(new_password), email.lower().strip()),
+            )
+            changed = result.rowcount > 0
+            conn.commit()
+            conn.close()
+            return changed
+        except Exception:
+            return False
+
     # ─────────────────────────────────────────────────────────────────────────
     # ACTION ITEMS
     # ─────────────────────────────────────────────────────────────────────────
