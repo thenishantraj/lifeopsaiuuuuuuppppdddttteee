@@ -4,6 +4,11 @@ import sys
 from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    AUTOREFRESH_AVAILABLE = False
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -542,19 +547,10 @@ def _render_forgot_password():
                 # Check it is a verified account
                 fp_email_clean = fp_email.strip().lower()
                 conn_check = None
-                try:
-                    from database import get_conn as _gc
-                    c = _gc()
-                    row = c.execute(
-                        "SELECT is_verified FROM users WHERE email=?", (fp_email_clean,)
-                    ).fetchone()
-                    c.close()
-                    if row and not row["is_verified"]:
-                        st.error("This account is not verified yet. "
-                                 "Please complete registration first.")
-                        return
-                except Exception:
-                    pass
+                if not db.is_email_verified(fp_email_clean):
+                    st.error("This account is not verified yet. "
+                             "Please complete registration first.")
+                    return
                 with st.spinner("Sending reset code…"):
                     success, otp_code, msg = send_otp_email(fp_email_clean)
                 if not success:
@@ -936,7 +932,7 @@ def dashboard_page():
 
         _api_key_cached = get_api_key()
         if not _api_key_cached:
-            st.warning("AI Analysis Completed Successfully")
+            st.warning("⚠️ No GOOGLE_API_KEY configured. AI analysis will use built-in offline mode.")
 
         r1, _, r3 = st.columns([2, 1, 2])
         with r1:
@@ -1324,17 +1320,53 @@ def study_center_page():
                     st.session_state.p_focus_level    = focus
                     st.rerun()
             else:
+                # ── Auto-refresh every second while timer is running ──────────
+                if AUTOREFRESH_AVAILABLE:
+                    st_autorefresh(interval=1000, limit=None, key="pomodoro_refresh")
+
+                # ── Decrement the timer by 1 second each refresh ──────────────
+                if st.session_state.pomodoro_active:
+                    if st.session_state.pomodoro_time > 0:
+                        st.session_state.pomodoro_time -= 1
+                    else:
+                        # Time's up — switch phase
+                        if st.session_state.pomodoro_work:
+                            st.session_state.pomodoro_time = st.session_state.break_time
+                            st.session_state.pomodoro_work = False
+                            st.success("⏰ Break time! Well done.")
+                        else:
+                            work_min = st.session_state.get("p_work_min", 25)
+                            st.session_state.pomodoro_time = work_min * 60
+                            st.session_state.pomodoro_work = True
+                            st.info("🍅 Break over — back to focus!")
+
                 mins, secs = divmod(st.session_state.pomodoro_time, 60)
                 phase = "FOCUS" if st.session_state.pomodoro_work else "BREAK"
+                phase_color = "#E53935" if st.session_state.pomodoro_work else "#43A047"
+                total_secs  = (st.session_state.get("p_work_min", 25) * 60
+                               if st.session_state.pomodoro_work
+                               else st.session_state.break_time)
+                progress_pct = max(0, int(
+                    (total_secs - st.session_state.pomodoro_time) / max(total_secs, 1) * 100
+                ))
+
                 st.markdown(
-                    '<div class="timer-card">'
-                    '<div class="timer-phase">' + phase + "</div>"
+                    '<div class="timer-card" style="position:relative;">'
+                    '<div class="timer-phase" style="background:rgba(255,255,255,0.25);">' + phase + "</div>"
                     '<div class="timer-digits">'
                     + str(mins).zfill(2) + ":" + str(secs).zfill(2) + "</div>"
                     '<div class="timer-subject">📚 '
-                    + st.session_state.pomodoro_subject + "</div></div>",
+                    + st.session_state.pomodoro_subject + "</div>"
+                    '<div style="margin-top:14px;background:rgba(255,255,255,0.2);'
+                    'border-radius:8px;height:6px;overflow:hidden;">'
+                    '<div style="height:6px;border-radius:8px;background:rgba(255,255,255,0.85);'
+                    'width:' + str(progress_pct) + '%;transition:width 0.5s ease;"></div>'
+                    "</div></div>",
                     unsafe_allow_html=True,
                 )
+                if not AUTOREFRESH_AVAILABLE:
+                    st.caption("ℹ️ Add `streamlit-autorefresh` to requirements.txt for live countdown.")
+
                 st.markdown("<br>", unsafe_allow_html=True)
                 cc1, cc2, cc3 = st.columns(3)
                 with cc1:
@@ -1357,7 +1389,7 @@ def study_center_page():
                         work_min = st.session_state.get("p_work_min", 25)
                         elapsed  = work_min * 60 - st.session_state.pomodoro_time
                         duration = max(1, elapsed // 60)
-                        if st.session_state.pomodoro_work:
+                        if st.session_state.pomodoro_work and elapsed > 30:
                             db.add_study_session(
                                 uid, duration, st.session_state.pomodoro_subject,
                                 st.session_state.get("p_focus_level", 7),
