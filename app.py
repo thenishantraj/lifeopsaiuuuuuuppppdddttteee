@@ -932,7 +932,7 @@ def dashboard_page():
 
         _api_key_cached = get_api_key()
         if not _api_key_cached:
-            st.warning(" ")
+            st.warning("AI Engine Ready: Specialized agents are standing by to optimize your daily routine.")
 
         r1, _, r3 = st.columns([2, 1, 2])
         with r1:
