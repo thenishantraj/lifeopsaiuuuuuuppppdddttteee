@@ -282,6 +282,12 @@ def init_state():
         "otp_pass": "",
         "otp_ts": None,
         "otp_attempts": 0,
+        # Forgot password flow
+        "fp_step": 0,          # 0=off 1=enter-email 2=otp-sent 3=new-password
+        "fp_email": "",
+        "fp_otp_code": "",
+        "fp_otp_ts": None,
+        "fp_otp_attempts": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -505,6 +511,164 @@ def _render_otp_verify_ui():
             st.rerun()
 
 
+
+def _render_forgot_password():
+    """3-step forgot password: enter email → verify OTP → set new password."""
+    step = st.session_state.fp_step
+
+    # Step 1 ── ask for email
+    if step == 1:
+        st.markdown(
+            '''<div style="background:#EEF2FF;border:1px solid #C7D2FE;
+            border-radius:12px;padding:16px 20px;margin-bottom:16px;">
+            <div style="font-size:15px;font-weight:700;color:#4338CA;margin-bottom:4px;">
+            🔑 Reset Your Password</div>
+            <div style="font-size:13px;color:#64748B;">
+            Enter the email address you used to register. We will send a verification code.</div>
+            </div>''',
+            unsafe_allow_html=True,
+        )
+        with st.form("fp_email_form"):
+            fp_email = st.text_input("Registered email", placeholder="you@example.com",
+                                     key="fp_email_input")
+            sub = st.form_submit_button("Send Reset Code →", type="primary",
+                                        use_container_width=True)
+        if sub:
+            if not fp_email.strip():
+                st.error("Please enter your email.")
+            elif not db.email_exists(fp_email.strip()):
+                st.error("No account found with this email address.")
+            else:
+                # Check it is a verified account
+                fp_email_clean = fp_email.strip().lower()
+                conn_check = None
+                try:
+                    from database import get_conn as _gc
+                    c = _gc()
+                    row = c.execute(
+                        "SELECT is_verified FROM users WHERE email=?", (fp_email_clean,)
+                    ).fetchone()
+                    c.close()
+                    if row and not row["is_verified"]:
+                        st.error("This account is not verified yet. "
+                                 "Please complete registration first.")
+                        return
+                except Exception:
+                    pass
+                with st.spinner("Sending reset code…"):
+                    success, otp_code, msg = send_otp_email(fp_email_clean)
+                if not success:
+                    st.error("Could not send code: " + msg)
+                    return
+                st.session_state.fp_email       = fp_email_clean
+                st.session_state.fp_otp_code    = otp_code
+                st.session_state.fp_otp_ts      = datetime.now()
+                st.session_state.fp_otp_attempts = 0
+                st.session_state.fp_step        = 2
+                st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("← Back to Sign In", key="fp_back_1"):
+            st.session_state.fp_step = 0
+            st.rerun()
+
+    # Step 2 ── verify OTP
+    elif step == 2:
+        fp_email = st.session_state.fp_email
+        st.markdown(
+            '''<div style="background:#EEF2FF;border:1px solid #C7D2FE;
+            border-radius:12px;padding:16px 20px;margin-bottom:16px;">
+            <div style="font-size:15px;font-weight:700;color:#4338CA;margin-bottom:4px;">
+            ✉️ Enter Verification Code</div>
+            <div style="font-size:13px;color:#64748B;">
+            A 6-digit code was sent to <strong>''' + fp_email + '''</strong>.<br/>
+            Valid for <strong>10 minutes</strong>.</div></div>''',
+            unsafe_allow_html=True,
+        )
+        # Expiry check
+        otp_ts = st.session_state.get("fp_otp_ts")
+        if otp_ts and (datetime.now() - otp_ts).total_seconds() > 600:
+            st.warning("⏱️ Code expired. Please request a new one.")
+            st.session_state.fp_step = 1
+            st.rerun()
+            return
+
+        otp_in = st.text_input("6-digit code", placeholder="e.g. 847291",
+                                max_chars=6, key="fp_otp_input")
+        cv, cr, cb = st.columns([2, 1, 1])
+        with cv:
+            if st.button("✅ Verify Code", type="primary",
+                         use_container_width=True, key="fp_verify_btn"):
+                if not otp_in.strip():
+                    st.error("Please enter the code.")
+                elif st.session_state.fp_otp_attempts >= 5:
+                    st.error("Too many wrong attempts. Please start over.")
+                    st.session_state.fp_step = 1
+                    st.rerun()
+                elif otp_in.strip() == st.session_state.fp_otp_code:
+                    st.session_state.fp_step = 3
+                    st.rerun()
+                else:
+                    st.session_state.fp_otp_attempts += 1
+                    remaining = 5 - st.session_state.fp_otp_attempts
+                    st.error("Wrong code. " + str(remaining) + " attempt(s) left.")
+        with cr:
+            if st.button("🔄 Resend", use_container_width=True, key="fp_resend"):
+                with st.spinner("Resending…"):
+                    ok, new_code, err = send_otp_email(fp_email)
+                if ok:
+                    st.session_state.fp_otp_code     = new_code
+                    st.session_state.fp_otp_ts       = datetime.now()
+                    st.session_state.fp_otp_attempts = 0
+                    st.success("New code sent!")
+                else:
+                    st.error("Failed: " + err)
+        with cb:
+            if st.button("← Back", use_container_width=True, key="fp_back_2"):
+                st.session_state.fp_step = 1
+                st.rerun()
+
+    # Step 3 ── set new password
+    elif step == 3:
+        fp_email = st.session_state.fp_email
+        st.markdown(
+            '''<div style="background:#DCFCE7;border:1px solid #BBF7D0;
+            border-radius:12px;padding:16px 20px;margin-bottom:16px;">
+            <div style="font-size:15px;font-weight:700;color:#166534;margin-bottom:4px;">
+            ✅ Identity Verified</div>
+            <div style="font-size:13px;color:#166534;">
+            Set a new password for <strong>''' + fp_email + '''</strong></div>
+            </div>''',
+            unsafe_allow_html=True,
+        )
+        with st.form("fp_newpass_form"):
+            new_p  = st.text_input("New password", type="password",
+                                   placeholder="Min 6 characters", key="fp_new_pass")
+            new_p2 = st.text_input("Confirm new password", type="password",
+                                   placeholder="Repeat password", key="fp_confirm_pass")
+            sub = st.form_submit_button("Update Password →", type="primary",
+                                        use_container_width=True)
+        if sub:
+            if not new_p or not new_p2:
+                st.error("Please fill both fields.")
+            elif len(new_p) < 6:
+                st.error("Password must be at least 6 characters.")
+            elif new_p != new_p2:
+                st.error("Passwords do not match.")
+            else:
+                if db.reset_password_by_email(fp_email, new_p):
+                    st.success("🎉 Password updated successfully! Please sign in.")
+                    # Clear all fp state
+                    st.session_state.fp_step         = 0
+                    st.session_state.fp_email        = ""
+                    st.session_state.fp_otp_code     = ""
+                    st.session_state.fp_otp_ts       = None
+                    st.session_state.fp_otp_attempts = 0
+                    st.rerun()
+                else:
+                    st.error("Failed to update password. Please try again.")
+
+
 def login_page():
     st.markdown("""
 <style>
@@ -525,35 +689,48 @@ def login_page():
         tab1, tab2 = st.tabs(["  Sign In  ", "  Create Account  "])
 
         with tab1:
-            with st.form("login_form", clear_on_submit=False):
-                email    = st.text_input("Email address", placeholder="you@example.com")
-                password = st.text_input("Password", type="password", placeholder="••••••••")
-                st.markdown("<br>", unsafe_allow_html=True)
-                submitted = st.form_submit_button(
-                    "Sign in to LifeOps →", type="primary", use_container_width=True
-                )
-            if submitted:
-                if not email or not password:
-                    st.error("Please fill in all fields.")
-                else:
-                    result = db.authenticate_user(email, password)
-                    if result == "unverified":
-                        st.warning(
-                            "⚠️ Your email is not verified yet. "
-                            "Please complete OTP verification in the Create Account tab."
-                        )
-                    elif result:
-                        st.session_state.authenticated = True
-                        st.session_state.user_id       = result["id"]
-                        st.session_state.user_data     = result
-                        st.session_state.current_page  = "Dashboard"
-                        api_k = get_api_key()
-                        if api_k:
-                            os.environ["GOOGLE_API_KEY"] = api_k
-                        load_user_data()
-                        st.rerun()
+            # ── Forgot password flow takes over tab1 when active ──────────────
+            if st.session_state.fp_step > 0:
+                _render_forgot_password()
+            else:
+                with st.form("login_form", clear_on_submit=False):
+                    email    = st.text_input("Email address", placeholder="you@example.com")
+                    password = st.text_input("Password", type="password", placeholder="••••••••")
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    submitted = st.form_submit_button(
+                        "Sign in to LifeOps →", type="primary", use_container_width=True
+                    )
+                if submitted:
+                    if not email or not password:
+                        st.error("Please fill in all fields.")
                     else:
-                        st.error("Invalid credentials. Please try again.")
+                        result = db.authenticate_user(email, password)
+                        if result == "unverified":
+                            st.warning(
+                                "⚠️ Your email is not verified yet. "
+                                "Please complete OTP verification in the Create Account tab."
+                            )
+                        elif result:
+                            st.session_state.authenticated = True
+                            st.session_state.user_id       = result["id"]
+                            st.session_state.user_data     = result
+                            st.session_state.current_page  = "Dashboard"
+                            api_k = get_api_key()
+                            if api_k:
+                                os.environ["GOOGLE_API_KEY"] = api_k
+                            load_user_data()
+                            st.rerun()
+                        else:
+                            st.error("Invalid credentials. Please try again.")
+
+                # Forgot password link
+                st.markdown("<br>", unsafe_allow_html=True)
+                col_fp, _ = st.columns([1, 2])
+                with col_fp:
+                    if st.button("🔑 Forgot Password?", key="open_fp",
+                                 use_container_width=True):
+                        st.session_state.fp_step = 1
+                        st.rerun()
 
         with tab2:
             if st.session_state.otp_pending:
@@ -757,8 +934,9 @@ def dashboard_page():
             "monthly_budget": budget, "current_expenses": expenses, "problem": problem,
         }
 
-        if not get_api_key():
-            st.warning("⚠️ No GOOGLE_API_KEY found. Analysis will use smart offline mode.")
+        _api_key_cached = get_api_key()
+        if not _api_key_cached:
+            st.warning("⚠️ No GOOGLE_API_KEY configured. AI analysis will use built-in offline mode.")
 
         r1, _, r3 = st.columns([2, 1, 2])
         with r1:
@@ -1576,8 +1754,6 @@ def run_ai_analysis(user_inputs):
     api_key = get_api_key()
     if api_key:
         os.environ["GOOGLE_API_KEY"] = api_key
-    else:
-        st.warning("⚠️ No API key found. Using smart offline analysis.")
 
     with st.spinner("🧠 Analyzing your life with AI…"):
         try:
